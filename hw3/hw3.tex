@@ -1,0 +1,214 @@
+% 并行与分布是计算作业模版
+\documentclass[UTF8]{ctexart}
+\CTEXsetup[format={\Large\bfseries}]{section}
+\usepackage{underscore}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{graphicx, subfig}
+\begin{document}
+\begin{titlepage}
+    %\vspace*{\fill}
+    \begin{center}
+        {\Huge 并行与分布式计算 \\}
+        \bigskip
+        \bigskip{\Large 数据竞争与可重入函数程序分析 \\}
+        %\bigskip{\Large bi}
+        %{\Large 并行指令与多线程编程 }
+        \medskip{\Large 第三次作业 \\}
+    \vspace*{\fill}
+    {\Large
+    \begin{tabular}{rl}
+        姓名 &：罗仁良 \\
+        班级 &：计科五班 \\
+        学号 &：18340126 \\
+    \end{tabular}
+    }
+    \end{center}
+\end{titlepage}
+\section{数据竞争}
+\subsection{实验内容}
+利用ThreadSanitizer分析程序中是否有潜在数据竞争出现。
+\subsection{实验结果}
+实验中设计了几个简单的存在数据竞争的函数，利用ThreadSanitizer分析结果，大多数结果都与符合实际，但遇到一种情况比较特殊，与实际相反。
+\subsubsection{程序一}
+\begin{lstlisting}[frame=shadowbox, rulesepcolor=\color{red!20!green!20!blue!20}] 
+int global;
+void * f1() {
+    global = 1;
+    return NULL; 
+}
+
+int main(void) {
+    pthread_t t1, t2;
+    pthread_create(&t1,NULL,f1,NULL);
+    pthread_create(&t2,NULL,f1,NULL);
+    pthread_join(t1,NULL);
+    pthread_join(t2,NULL);
+
+    return 0;
+}
+\end{lstlisting}
+线程t1和线程t2同时访问全局变量global，且存在写入，有数据竞争。结果如下图：
+\newpage
+\begin{figure}[h]
+    \centering
+    \includegraphics[scale = 0.5]{thread1.png}
+\end{figure}
+\subsubsection{程序二}
+\begin{lstlisting}[frame=shadowbox, rulesepcolor=\color{red!20!green!20!blue!20}] 
+static int  s;
+void *f2() {
+    s = 2;
+    printf("f2:%d\n",s);
+    return NULL;
+}
+
+void *f3() {
+    s = 3;
+    printf("f3:%d\n",s);
+    return NULL;
+}
+int main(void) {
+    pthread_t t3, t4;
+    pthread_create(&t3,NULL,f2,NULL);
+    pthread_create(&t4,NULL,f3,NULL);
+    pthread_join(t3,NULL);
+    pthread_join(t4,NULL);
+    return 0;
+}
+\end{lstlisting}
+\newpage
+使用threadSanitizer检测时程序并没有报错，结果如上图：
+\begin{figure}
+    \centering
+    \includegraphics[scale = 0.5]{thread2.png}
+\end{figure}
+但是分析程序可以知道，printf是非原子操作，若此时另外的线程对s进行写，就可能出现数据竞争。
+为了检测数据竞争，将源程序进行了改进。循环打印s，每次打印sleep(1)，得到如下结果：
+\begin{figure}[h]
+    \centering
+    \includegraphics[scale = 0.5]{thread3.png}
+\end{figure}
+从检测结果可以知道，存在数据竞争，此时threadSanitizer也分析出有数据竞争。
+\section{IR 自动分析程序设计}
+\subsection{设计目标}
+设计一个程序自动分析llvm的中间代码，判断一个函数是否为可重入函数。
+\subsection{设计思路}
+llvm编译产生的中间代码具有一定的易读性和特点。自动分析程序主要利用了IR的两大特点：
+\begin{itemize}
+    \item [(1)] 全局变量由@和global标识
+    \item [(2)] 函数声明有define和@标识 
+\end{itemize}
+所以设计的主要思路就是分析中间代码中由@标识的全局变量和用户声明的函数中是否存在使用全局变量和使用系统调用的函数。
+\subsection{代码分析}
+\subsubsection{数据定义}
+\begin{lstlisting}[frame=shadowbox, rulesepcolor=\color{red!20!green!20!blue!20}] 
+//记录函数名和标识是否为可重入函数
+typedef struct Function {
+    string name;    //函数名
+    int Reentrant;  //不可重入：0；可重入：1
+    Function(string s, int Reentrant):name(s), 
+    Reentrant(Reentrant) {}
+} Function;
+
+vector<Function> func_lib; //库函数记录,主要是系统调用
+vector<Function> user_func;//用户函数记录
+\end{lstlisting}
+每分析出一个函数，在记录它的可重入性的同时，将它添加到库函数和用户函数记录中。若存在函数调用，就在库函数中查询调用函数的可重入性。
+初始的库函数记录中已经记录了系统调用相关的函数信息，如，printf，malloc等函数。
+\newpage
+\subsubsection{算法分析}
+使用每次读一行，对IR code进行分析，首先寻找是否存在 @ 标识符，再确定是否为全局变量。
+\begin{lstlisting}[frame=shadowbox, rulesepcolor=\color{red!20!green!20!blue!20}] 
+it = find(line.begin(),line.end(),'@');
+\end{lstlisting}
+如果是全局变量，分析出变量名，添加到库函数记录中，标记为非可重入“函数”。
+\begin{lstlisting}[frame=shadowbox, rulesepcolor=\color{red!20!green!20!blue!20}] 
+if( line.find("global")  != string::npos) {
+    string name;
+    it++;
+    while(*it != ' ') {
+        name += *it;
+        it++;
+    }
+    func_lib.push_back(Function(name,0));
+}
+\end{lstlisting}
+搜索完全局变量，再通过\textbf{define}寻找用户函数声明
+\begin{lstlisting}[frame=shadowbox, rulesepcolor=\color{red!20!green!20!blue!20}] 
+    if(line.find("define") != string::npos )
+    //找到函数声明分析函数名
+    string func_name;
+    int Reentrant = 1;
+    it++;
+    while(*it != '(') {
+        func_name += *it;
+        it++;
+    }
+\end{lstlisting}
+\newpage
+找到函数声明，分析函数中是否使用全局变量、调用非可重入函数、系统调用等。寻找方式同上面描述的方式一样，搜索全局变量标识符@。找到之后在库函数记录中对比即可。
+\begin{lstlisting}[frame=shadowbox, rulesepcolor=\color{red!20!green!20!blue!20}] 
+vector<Function>::iterator i = func_lib.begin();
+while( i != func_lib.end() ) {
+    if(i->name == name) {
+        if(i->Reentrant == 0) {
+            Reentrant = 0;
+            break;
+        }
+    }
+    i++;
+}
+\end{lstlisting}
+\subsection{运行结果}
+\subsubsection{样例程序}
+\begin{lstlisting}[frame=shadowbox, rulesepcolor=\color{red!20!green!20!blue!20}] 
+    //=============  使用全局变量 ==============
+    int value = 1;
+    void *f1() {
+        value = 4;
+        return NULL;
+    }
+    //============= 使用堆 ==================
+    void *f2() {
+        int *p = malloc(8*sizeof(int));
+        for(int i=0; i < 8; i++) {
+            p[i] = i;
+        }
+        return NULL;
+    }
+
+    //============= 调用不可重入函数 ============
+    void *f3() {
+        f1();
+        return NULL;
+    }
+    //============= 系统调用 I/O ==============
+    void *f4() {
+        printf("stdio\n");
+        return NULL;
+    }
+    //============ 返回全局变量 ================
+    
+    void *f5() {
+        return &value;
+    }
+    //============ 可重入函数 =================
+    void *f(){
+        return NULL;
+    }
+    int fff(int a) {
+        return a+1;
+    }
+\end{lstlisting}
+\subsubsection{结果截图}
+\begin{figure}[h]
+    \centering
+    \includegraphics[]{re.png}
+\end{figure}
+\section{实验总结}
+通过数据竞争的实验熟悉了ThreadSanitizer在多线程程序中检测数据竞争的方法，加深了数据竞争产生的原因以及在多线程编程中尽量使得数据本地化避免数据竞争。自动分析程序设计其实难度是挺大的，只是我在设计的过程中简化了判断方式。
+还是有很多缺陷的，比如函数同名等问题没有解决，分析程序也只是给出了一个函数是否为可重入函数，没有给出更加具体的分析。这些都是值得改进的地方。
+总而言之，本次实验基本了解llvm中的部分知识和使用其中的部分工具帮助程序分析，还有很多地方需要进一步的学习、探索。
+\end{document}
